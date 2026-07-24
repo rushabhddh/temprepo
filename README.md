@@ -1,44 +1,135 @@
-# iPhone 17 256GB — Apple pickup monitor (GitHub Action)
+# iPhone 17 Pickup Monitor (Apple India)
 
-Checks Apple India's live in-store **pickup** availability for the iPhone 17
-256GB (all colours) at **Apple BKC** and **Apple Borivali**, and sends a
-**Telegram** message the moment a colour becomes pickup-available at either store.
-Stays silent otherwise.
+Checks in-store **pickup** availability for iPhone 17 256GB (all colours) at Apple BKC
+and Apple Borivali via Apple's `buyability-message` JSON API, and alerts on Telegram.
 
-## How it works
-- Calls Apple India's public `buyability-message` API for both stores. The `apu`
-  block in the response = Apple Pickup availability at that store.
-- Runs on GitHub's servers on a cron schedule — nothing needs to stay open on your
-  computer. The API is globally routed, so it works fine from GitHub's runners.
+Built to run **stateless** (cron / GitHub Actions): each run exits on its own. A small
+SQLite file is the shared state that gives you history, a dashboard, and anti-spam
+across those independent runs.
 
-## Setup (one time, ~3 minutes)
+## Files
 
-1. **Create a GitHub repo** (private is fine), e.g. `iphone-pickup-monitor`.
-2. Add these two files, keeping the exact paths:
-   - `check.py`  →  repo root
-   - `.github/workflows/iphone-monitor.yml`  ← rename/move `iphone-monitor.yml` into this path
-3. **Add secrets:** repo → *Settings → Secrets and variables → Actions → New repository secret*. Add:
-   - `TELEGRAM_TOKEN` = your bot token (`1446577636:AAG...hgCk`)
-   - `TELEGRAM_CHAT_ID` = `549489041`
-   (Keeping these as secrets means the token isn't committed in the code.)
-4. Push. Go to the **Actions** tab, and if prompted, enable workflows.
-5. Click the workflow → **Run workflow** to test it once manually. You'll see
-   `AVAILABLE: NONE` in the logs (correct — not in stock yet).
+| File | Purpose | Needs |
+|------|---------|-------|
+| `monitor.py` | The checker. Run this on a schedule. | stdlib (cloudscraper optional) |
+| `db.py` | SQLite history + notification cooldown state. | stdlib |
+| `dashboard.py` | On-demand web dashboard + REST API (read-only). | Flask |
+| `requirements.txt` | Optional deps only. | — |
 
-That's it. From then on it checks every 5 minutes and pings your Telegram when
-pickup opens up.
+## What was added vs. the original script
+
+The original 3-state logic (`available` / `nostock` / `unverified`, never guessed) is
+**unchanged**. On top of it:
+
+- **Error recovery / retries** — each store fetch retries with exponential backoff
+  (`FETCH_RETRIES`, `FETCH_BACKOFF`) before it's declared UNVERIFIED, so a transient
+  blip doesn't trigger a false "couldn't verify" alert.
+- **Anti-block fallback** — rotates the User-Agent across retries, then falls back to
+  `cloudscraper` (if installed) when plain `urllib` is blocked. If cloudscraper isn't
+  installed, it's simply skipped.
+- **Rate limiting / anti-spam** — an identical alert (same colours@stores, or same set
+  of unverified stores) is suppressed within a cooldown window (`ALERT_COOLDOWN_SECONDS`,
+  default 6h). The last-sent timestamp lives in SQLite, so suppression works even though
+  each cron run is a fresh process. Real stock transitions after the window still alert.
+- **History + dashboard + API** — every run logs per-store state and per-colour
+  buyability, and records a change event when a colour flips. `dashboard.py` serves a
+  live page plus JSON endpoints over that history.
+
+## Quick start (local)
+
+```bash
+export TELEGRAM_TOKEN=123456:abc
+export TELEGRAM_CHAT_ID=987654
+
+# one live check (alerts only on stock or total unverified)
+python monitor.py
+
+# always-report heartbeat
+HEARTBEAT=1 python monitor.py
+
+# view history (separate terminal; reads the same DB)
+pip install flask
+python dashboard.py        # http://127.0.0.1:5001
+```
+
+`monitor.py` runs with **zero** third-party packages. Install `cloudscraper` only if you
+want the anti-block fallback; install `Flask` only for the dashboard.
+
+## Environment variables
+
+| Var | Default | Meaning |
+|-----|---------|---------|
+| `TELEGRAM_TOKEN` | — (required) | Bot token |
+| `TELEGRAM_CHAT_ID` | — (required) | Chat/channel ID |
+| `HEARTBEAT` | `0` | `1` = always send a status message |
+| `DB_PATH` | `pickup_history.db` | Where state/history is stored |
+| `ALERT_COOLDOWN_SECONDS` | `21600` | Anti-spam window (6h) |
+| `FETCH_RETRIES` | `3` | Attempts per store fetch |
+| `FETCH_BACKOFF` | `2.0` | Base backoff seconds (doubles each retry) |
+| `DISABLE_DB` | `0` | `1` = pure-stdlib, no history/anti-spam (original behaviour) |
+
+## Persisting the DB on GitHub Actions
+
+The catch with a stateless runner: unless you persist `pickup_history.db`, every run
+starts blank — you lose history **and** anti-spam (so a long-lived stock could ping every
+run). Pick one:
+
+**Option A — commit the DB back (simplest, keeps full history):**
+
+```yaml
+name: pickup-monitor
+on:
+  schedule: [{ cron: "*/10 * * * *" }]   # every 10 min
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    concurrency: pickup-monitor          # avoid overlapping runs racing the DB
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install cloudscraper      # optional, enables anti-block fallback
+      - env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DB_PATH: pickup_history.db
+        run: python monitor.py
+      - run: |
+          git config user.name  "monitor-bot"
+          git config user.email "monitor-bot@users.noreply.github.com"
+          git add pickup_history.db
+          git commit -m "history $(date -u +%FT%TZ)" || echo "no change"
+          git pull --rebase --autostash && git push || echo "push skipped"
+```
+
+Add an hourly heartbeat by duplicating the job with `HEARTBEAT: "1"` on a `0 * * * *`
+cron.
+
+**Option B — no history, just correct alerts:** set `DISABLE_DB=1` and drop the commit
+step. You keep the monitor and Telegram alerts but lose history, the dashboard data, and
+cross-run anti-spam.
+
+> The dashboard is a **local viewer**, not a hosted service. Pull the repo (which now
+> contains `pickup_history.db`) and run `python dashboard.py` whenever you want to look.
+> To host it live, run `monitor.py` and `dashboard.py` on the same box (a small VM) with a
+> shared `DB_PATH` instead of GitHub Actions.
+
+## REST API
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /api/current` | Latest state per store + latest per-colour buyability |
+| `GET /api/history?store=R744&hours=24` | Raw per-store checks |
+| `GET /api/changes?days=7&became=1` | Colour buyability change events (`became=1` = only "became buyable") |
+| `GET /api/stats?days=7` | Per-store totals, verified rate, times became available |
 
 ## Notes
-- **Frequency:** GitHub scheduled workflows don't reliably run more often than
-  every ~5 min and can be delayed under load, so this uses `*/5`. (Every 3 min
-  isn't dependable on GitHub Actions.)
-- **Cron is UTC** on GitHub — doesn't matter here since it's a fixed interval.
-- **It alerts on every run while a colour is in stock**, so you'll keep getting
-  pings until you buy it or disable the workflow. To stop: disable the workflow
-  in the Actions tab.
-- **Reference data:**
-  - Part numbers: Black `MG6J4HN/A`, White `MG6K4HN/A`, Lavender `MG6M4HN/A`,
-    Sage `MG6N4HN/A`, Mist Blue `MG6Q4HN/A`
-  - Stores: `R744` = Apple BKC, `R757` = Apple Borivali
-- If Apple ever changes part numbers (new model year), update the `PARTS` dict in
-  `check.py`.
+
+- Store codes: `R744` = Apple BKC, `R757` = Apple Borivali. Part numbers are the five
+  iPhone 17 256GB India colours. Edit `PARTS` / `STORES` in `monitor.py` to change them.
+- The cookie and endpoint are Apple's public buyability path; if Apple changes the
+  response shape, the monitor reports **UNVERIFIED** (and alerts) rather than a false
+  "no stock".

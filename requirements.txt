@@ -1,0 +1,8 @@
+# monitor.py runs on the Python standard library alone.
+# Everything below is OPTIONAL and only needed for specific features:
+
+# Anti-block fallback (used automatically if urllib is blocked). Optional.
+cloudscraper>=1.2.71
+
+# Web dashboard + REST API (dashboard.py only). Not needed to run the monitor.
+Flask>=3.0.0
