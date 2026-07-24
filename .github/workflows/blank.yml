@@ -1,26 +1,65 @@
-name: iPhone 17 pickup monitor
+name: pickup-monitor
 
+# GitHub's cron is throttled and drops runs, so we don't rely on it for the
+# 3-minute cadence. Instead each run loops internally (check every 3 min for
+# ~42 min) and then re-triggers itself, giving continuous coverage. The
+# schedule below is only a safety net that restarts the chain if it ever breaks.
 on:
+  workflow_dispatch:
   schedule:
-    # GitHub cron is UTC and runs no more often than ~every 5 minutes.
-    - cron: "*/5 * * * *"
-  workflow_dispatch: {}   # lets you run it manually from the Actions tab
+    - cron: "*/30 * * * *"
 
-# Prevent overlapping runs if one is slow
+# Only ever one loop alive; extra triggers queue (max one pending) instead of
+# overlapping or piling up.
 concurrency:
-  group: iphone-monitor
+  group: pickup-monitor
   cancel-in-progress: false
 
+permissions:
+  contents: write     # commit pickup_history.db back
+  actions: write      # let the job re-dispatch itself
+
 jobs:
-  check:
+  monitor:
     runs-on: ubuntu-latest
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Check Apple pickup availability
+
+      - name: Install optional anti-block fallback
+        run: pip install cloudscraper
+
+      - name: Check every 3 minutes for ~42 minutes
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python check.py
+          DB_PATH: pickup_history.db
+        run: |
+          CHECKS=15          # 15 checks, 3 min apart -> ~42 min of coverage
+          for i in $(seq 1 $CHECKS); do
+            echo "=== check $i/$CHECKS at $(date -u +%H:%M:%S)Z ==="
+            python monitor.py || echo "check $i errored, continuing"
+            if [ "$i" -lt "$CHECKS" ]; then sleep 180; fi
+          done
+
+      - name: Persist history DB
+        run: |
+          git config user.name  "monitor-bot"
+          git config user.email "monitor-bot@users.noreply.github.com"
+          git pull --rebase --autostash || true
+          if [[ -n "$(git status --porcelain pickup_history.db)" ]]; then
+            git add pickup_history.db
+            git commit -m "history $(date -u +%FT%TZ)"
+            git push || echo "push skipped"
+          else
+            echo "No DB changes to commit."
+          fi
+
+      - name: Re-trigger the next loop
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run monitor.yml
