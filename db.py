@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
 """SQLite state + history for the Apple India pickup monitor.
 
-This is the shared state that makes a *stateless* cron/GitHub Actions run
-behave like a stateful monitor. Every run writes:
-  - one `checks` row per store (the resolved state: available/nostock/unverified)
+Every run writes:
+  - one `checks` row per store (resolved state: available/nostock/unverified)
   - one `colour_status` row per verified colour (isBuyable true/false)
   - `changes` rows whenever a colour's buyability flips vs. the previous run
-  - `notifications` rows recording when we last alerted (for anti-spam cooldown)
 
-The dashboard reads this same DB read-only.
+The dashboard / export read this DB read-only.
 
 DB location is DB_PATH env var, default ./pickup_history.db. On GitHub Actions,
-point DB_PATH at a path you persist between runs (committed artifact, cache, or
-a mounted volume) so history and cooldown state survive.
+point DB_PATH at a path you persist between runs so history survives.
 """
 import os
 import sqlite3
@@ -41,7 +38,7 @@ def init_db(db_path=None):
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 store_id   TEXT NOT NULL,
                 store_name TEXT NOT NULL,
-                state      TEXT NOT NULL,          -- available | nostock | unverified
+                state      TEXT NOT NULL,
                 detail     TEXT,
                 checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -53,7 +50,7 @@ def init_db(db_path=None):
                 store_name  TEXT NOT NULL,
                 part        TEXT NOT NULL,
                 colour      TEXT NOT NULL,
-                is_buyable  INTEGER NOT NULL,       -- 0/1
+                is_buyable  INTEGER NOT NULL,
                 checked_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -64,17 +61,9 @@ def init_db(db_path=None):
                 store_name   TEXT NOT NULL,
                 part         TEXT NOT NULL,
                 colour       TEXT NOT NULL,
-                prev_buyable INTEGER,               -- NULL on first sighting
+                prev_buyable INTEGER,
                 new_buyable  INTEGER NOT NULL,
                 changed_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS notifications (
-                id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                kind      TEXT NOT NULL,            -- available | unverified
-                signature TEXT NOT NULL,            -- what we alerted about
-                sent_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
         for stmt in (
@@ -82,13 +71,11 @@ def init_db(db_path=None):
             "CREATE INDEX IF NOT EXISTS idx_checks_store ON checks(store_id, checked_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_colour_time ON colour_status(store_id, part, checked_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_changes_time ON changes(changed_at DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_notif ON notifications(kind, signature, sent_at DESC)",
         ):
             c.execute(stmt)
 
 
 def record_check(store_id, store_name, state, detail, db_path=None):
-    """Log the resolved per-store state for this run."""
     with _conn(db_path) as conn:
         conn.execute(
             "INSERT INTO checks (store_id, store_name, state, detail) VALUES (?,?,?,?)",
@@ -97,11 +84,9 @@ def record_check(store_id, store_name, state, detail, db_path=None):
 
 
 def record_colour(store_id, store_name, part, colour, is_buyable, db_path=None):
-    """Log a single colour's verified buyability, and a change row if it flipped."""
     is_buyable = 1 if is_buyable else 0
     with _conn(db_path) as conn:
         c = conn.cursor()
-        # Previous verified value for this store+part (if any).
         c.execute(
             "SELECT is_buyable FROM colour_status "
             "WHERE store_id=? AND part=? ORDER BY checked_at DESC, id DESC LIMIT 1",
@@ -109,7 +94,6 @@ def record_colour(store_id, store_name, part, colour, is_buyable, db_path=None):
         )
         row = c.fetchone()
         prev = row["is_buyable"] if row else None
-
         c.execute(
             "INSERT INTO colour_status (store_id, store_name, part, colour, is_buyable) "
             "VALUES (?,?,?,?,?)",
@@ -123,32 +107,9 @@ def record_colour(store_id, store_name, part, colour, is_buyable, db_path=None):
             )
 
 
-def recently_notified(kind, signature, cooldown_seconds, db_path=None):
-    """True if we already sent this exact alert within the cooldown window."""
-    with _conn(db_path) as conn:
-        c = conn.cursor()
-        c.execute(
-            "SELECT sent_at FROM notifications "
-            "WHERE kind=? AND signature=? "
-            "AND sent_at > datetime('now', ?) "
-            "ORDER BY sent_at DESC LIMIT 1",
-            (kind, signature, f"-{int(cooldown_seconds)} seconds"),
-        )
-        return c.fetchone() is not None
-
-
-def record_notification(kind, signature, db_path=None):
-    with _conn(db_path) as conn:
-        conn.execute(
-            "INSERT INTO notifications (kind, signature) VALUES (?,?)",
-            (kind, signature),
-        )
-
-
-# ---- read helpers used by the dashboard/API ----
+# ---- read helpers used by the dashboard / export ----
 
 def current_status(db_path=None):
-    """Latest check per store + latest verified colour statuses."""
     with _conn(db_path) as conn:
         c = conn.cursor()
         stores = c.execute("""
