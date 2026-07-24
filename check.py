@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """Check Apple India in-store PICKUP availability for iPhone 17 256GB
-at Apple BKC and Apple Borivali, and send a Telegram alert if available.
+at Apple BKC and Apple Borivali, and send a Telegram alert.
+
+Two modes (controlled by the HEARTBEAT env var):
+  - Default (HEARTBEAT unset/0): alert ONLY when a colour is pickup-available.
+    Silent otherwise. Use this for the frequent (every-5-min) run.
+  - HEARTBEAT=1: always send a status message ("still running" + current
+    status + timestamp), whether or not stock is available. Use this hourly.
 
 Uses Apple India's public buyability API. The `apu` block in the response
 = Apple Pickup availability at the given store.
 """
+import datetime
 import json
 import os
 import urllib.parse
@@ -26,6 +33,9 @@ UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
 
 TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+HEARTBEAT = os.environ.get("HEARTBEAT", "0") == "1"
+
+BUY_URL = "https://www.apple.com/in/shop/buy-iphone/iphone-17"
 
 
 def fetch(url):
@@ -41,12 +51,18 @@ def send_telegram(text):
         print("Telegram:", r.read().decode()[:200])
 
 
+def ist_now():
+    ist = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+    return datetime.datetime.now(ist).strftime("%d %b %Y, %I:%M %p IST")
+
+
 def main():
     query = "&".join(
         f"parts.{i}={urllib.parse.quote(p, safe='')}"
         for i, p in enumerate(PARTS)
     )
     available = []
+    errors = 0
     for sid, sname in STORES.items():
         url = f"https://www.apple.com/in/shop/buyability-message?{query}&store={sid}"
         try:
@@ -54,22 +70,35 @@ def main():
             apu = data["body"]["content"]["buyabilityMessage"].get("apu", {})
         except Exception as e:
             print(f"WARN {sname}: {e}")
+            errors += 1
             apu = {}
         for part, v in apu.items():
             if v.get("isBuyable") is True:
                 available.append(f"{PARTS.get(part, part)} @ {sname}")
 
+    now = ist_now()
+
     if available:
-        msg = (
+        print("AVAILABLE:", "; ".join(available))
+        send_telegram(
             "\U0001F389 iPhone 17 256GB pickup AVAILABLE now: "
             + "; ".join(available)
-            + ".\nReserve/buy: https://www.apple.com/in/shop/buy-iphone/iphone-17 "
-            "→ choose 'Pick up' and select the store."
+            + f".\nReserve/buy: {BUY_URL} → choose 'Pick up' and pick the store.\n"
+            + f"(checked {now})"
         )
-        print("AVAILABLE:", "; ".join(available))
-        send_telegram(msg)
-    else:
-        print("AVAILABLE: NONE (staying silent)")
+        return
+
+    print("AVAILABLE: NONE")
+
+    if HEARTBEAT:
+        status = "not available for pickup yet" if errors < len(STORES) else (
+            "could not reach Apple this run (will retry)"
+        )
+        send_telegram(
+            "✅ Monitor is running.\n"
+            f"iPhone 17 256GB @ Apple BKC / Borivali: {status}.\n"
+            f"Last checked: {now}"
+        )
 
 
 if __name__ == "__main__":
