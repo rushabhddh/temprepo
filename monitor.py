@@ -18,19 +18,19 @@ Added capabilities (all safe for stateless cron / GitHub Actions):
   - Error recovery: each fetch retries with exponential backoff.
   - Anti-block fallback: rotates User-Agent, and falls back to cloudscraper
     (if installed) when plain urllib is blocked.
-  - Rate limiting / anti-spam: identical alerts are suppressed within a cooldown
-    window (state persisted in SQLite, so it works across separate cron runs).
   - History: every run logs per-store state and per-colour buyability to SQLite,
     recording change events when a colour flips. This feeds dashboard.py.
+
+There is NO alert cooldown: every run that finds stock (or can't verify) alerts,
+so a drop is never silenced.
 
 Env vars:
   TELEGRAM_TOKEN, TELEGRAM_CHAT_ID   (required)
   HEARTBEAT=1                        (optional; always report)
-  DB_PATH=pickup_history.db          (optional; where to persist state/history)
-  ALERT_COOLDOWN_SECONDS=21600       (optional; anti-spam window, default 6h)
+  DB_PATH=pickup_history.db          (optional; where to persist history)
   FETCH_RETRIES=3                    (optional; attempts per store fetch)
   FETCH_BACKOFF=2.0                  (optional; seconds, doubled each retry)
-  DISABLE_DB=1                       (optional; run pure-stdlib, no history/anti-spam)
+  DISABLE_DB=1                       (optional; run pure-stdlib, no history)
 """
 import datetime
 import json
@@ -64,13 +64,12 @@ TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 HEARTBEAT = os.environ.get("HEARTBEAT", "0") == "1"
 DISABLE_DB = os.environ.get("DISABLE_DB", "0") == "1"
-COOLDOWN = int(os.environ.get("ALERT_COOLDOWN_SECONDS", "21600"))  # 6h default
 RETRIES = max(1, int(os.environ.get("FETCH_RETRIES", "3")))
 BACKOFF = float(os.environ.get("FETCH_BACKOFF", "2.0"))
 BUY_URL = "https://www.apple.com/in/shop/buy-iphone/iphone-17"
 
-# DB is optional: if it can't be imported/opened, we degrade to the original
-# stateless behaviour rather than crash.
+# DB is optional: if it can't be imported/opened, we degrade to plain stateless
+# behaviour rather than crash.
 db = None
 if not DISABLE_DB:
     try:
@@ -78,7 +77,7 @@ if not DISABLE_DB:
         _db.init_db()
         db = _db
     except Exception as e:  # noqa: BLE001
-        print(f"[warn] history/anti-spam disabled (db unavailable): {e}")
+        print(f"[warn] history disabled (db unavailable): {e}")
 
 
 def _fetch_urllib(url, ua):
@@ -174,23 +173,6 @@ def _finish(sid, state, detail, verified):
     return state, detail
 
 
-def _alert_once(kind, signature, text):
-    """Send unless an identical alert went out within the cooldown window."""
-    if db is not None:
-        try:
-            if db.recently_notified(kind, signature, COOLDOWN):
-                print(f"[anti-spam] suppressed {kind} alert (cooldown active): {signature}")
-                return
-        except Exception as e:  # noqa: BLE001
-            print(f"[warn] cooldown check failed, sending anyway: {e}")
-    send_telegram(text)
-    if db is not None:
-        try:
-            db.record_notification(kind, signature)
-        except Exception as e:  # noqa: BLE001
-            print(f"[warn] failed to record notification: {e}")
-
-
 def main():
     query = "&".join(
         f"parts.{i}={urllib.parse.quote(p, safe='')}" for i, p in enumerate(PARTS)
@@ -209,31 +191,28 @@ def main():
     ]
     unverified = [STORES[sid] for sid, (state, _) in results.items() if state == "unverified"]
 
-    # 1) Real stock -> alert (any mode), rate-limited by exact availability set.
+    # 1) Real stock -> always alert (any mode). No cooldown: every run pings.
     if available:
-        signature = "available:" + ";".join(sorted(available))
-        _alert_once(
-            "available", signature,
+        send_telegram(
             "\U0001F389 iPhone 17 256GB pickup AVAILABLE now: "
             + "; ".join(available)
             + f".\nReserve/buy: {BUY_URL} → choose 'Pick up' and pick the store.\n"
-            + f"(checked {now})",
+            + f"(checked {now})"
         )
         return
 
-    # 2) Couldn't verify (both stores) on a normal run -> alert so silence is never
-    #    mistaken for "no stock". Rate-limited by the set of unverified stores.
+    # 2) Couldn't verify (both stores) on a normal run -> alert, so silence is
+    #    never mistaken for "no stock". One-off single-store blips are left for
+    #    the heartbeat to surface.
     if len(unverified) == len(STORES) and not HEARTBEAT:
-        signature = "unverified:" + ";".join(sorted(unverified))
-        _alert_once(
-            "unverified", signature,
+        send_telegram(
             "⚠️ Monitor could NOT verify pickup status this run "
             f"({', '.join(unverified)}). Apple API may have changed or is blocking. "
-            f"Will keep trying. ({now})",
+            f"Will keep trying. ({now})"
         )
         return
 
-    # 3) Heartbeat -> report exactly what was found per store (never rate-limited).
+    # 3) Heartbeat -> report exactly what was found per store.
     if HEARTBEAT:
         lines = []
         for sid, (state, detail) in results.items():
